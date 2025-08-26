@@ -1,0 +1,1516 @@
+require("dotenv").config();
+const { Telegraf, Markup } = require("telegraf");
+const OpenAI = require("openai");
+const axios = require("axios");
+const { createClient } = require("@supabase/supabase-js");
+
+// ===============================================================
+// =============== CONFIG Y CLIENTES EXTERNOS ====================
+// ===============================================================
+
+const requiredEnv = [
+  "TELEGRAM_BOT_TOKEN",
+  "OPENAI_API_KEY",
+  "SUPABASE_URL",
+  "SUPABASE_SERVICE_ROLE",
+  "OPENCAGE_API_KEY",
+];
+const missing = requiredEnv.filter((k) => !process.env[k]);
+if (missing.length) {
+  console.error("❌ Faltan variables de entorno:", missing.join(", "));
+  process.exit(1);
+}
+
+const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
+const oai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE
+);
+
+const CONSTANTS = Object.freeze({
+  TZ: "America/La_Paz",
+  ROLES: { ASESOR: "ASESOR", PROMOTOR: "PROMOTOR" },
+  BUCKETS: { ORDER_IMAGES: "order-images", DELIVERY_PROOFS: "delivery-proofs" },
+  WHOLESALE_KEYWORDS: [
+    "mayorista",
+    "al por mayor",
+    "por mayor",
+    "wholesale",
+    "fardo",
+    "bulto",
+    "caja",
+    "docena",
+  ],
+});
+
+// ===============================================================
+// ===================== ESTADO EN MEMORIA =======================
+// ===============================================================
+
+const STATE = new Map();
+const CONV = new Map();
+
+function getInitialState() {
+  return {
+    userProfile: null,
+    saleState: {
+      currentStep: "initial",
+      paymentMethod: null,
+      awaitingPhotoForBaseProduct: null,
+      partialOrder: {
+        items: [],
+        payments: [],
+        time_preference: null,
+        delivery_date: null,
+        customer_phone: null,
+        customer_name: null,
+        location: null,
+        notes: [],
+        image_url: null,
+        is_encomienda: null,
+        destino: null,
+        fecha_salida_bodega: null,
+        fecha_entrega_encomienda: null,
+      },
+    },
+    deliveryState: { currentOrderId: null, expecting: null },
+    returnState: {
+      currentStep: "initial",
+      originalOrder: null,
+      returnDetails: {
+        items: [],
+        reason: null,
+        return_amount: null,
+      },
+    },
+    lastSeen: Date.now(),
+  };
+}
+
+function getState(chatId) {
+  if (!STATE.has(chatId)) STATE.set(chatId, getInitialState());
+  const s = STATE.get(chatId);
+  s.lastSeen = Date.now();
+  return s;
+}
+
+function getHistory(chatId) {
+  if (!CONV.has(chatId)) CONV.set(chatId, []);
+  return CONV.get(chatId);
+}
+
+function pushHistory(chatId, message, type = "user") {
+  const h = getHistory(chatId);
+  h.push({ t: Date.now(), type, message });
+  if (h.length > 20) h.splice(0, h.length - 20);
+}
+
+// ===============================================================
+// ======================== UTILIDADES ===========================
+// ===============================================================
+
+function nowInLaPaz() {
+  const now = new Date();
+  return new Date(now.toLocaleString("en-US", { timeZone: CONSTANTS.TZ }));
+}
+
+function normalizeString(s) {
+  return String(s || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim();
+}
+
+function normalizePhone(p) {
+  if (!p) return null;
+  const digits = String(p).replace(/[^0-9+]/g, "");
+  if (/^\d{8}$/.test(digits)) return `+591${digits}`;
+  if (/^591\d{8}$/.test(digits)) return `+${digits}`;
+  if (/^\+\d{9,15}$/.test(digits)) return digits;
+  return digits || null;
+}
+
+function parseTimeRange(raw) {
+  if (!raw) return { from: null, to: null };
+  const t = normalizeString(raw);
+  const m = t.match(
+    /(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*[-a–]\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i
+  );
+  if (m) {
+    const h1 = Number(m[1]),
+      min1 = Number(m[2] || 0),
+      ap1 = (m[3] || "").toLowerCase();
+    function to24(h, ap) {
+      if (!ap) return h;
+      if (ap === "pm" && h < 12) return h + 12;
+      if (ap === "am" && h === 12) return 0;
+      return h;
+    }
+    const h2 = Number(m[4]),
+      min2 = Number(m[5] || 0),
+      ap2 = (m[6] || "").toLowerCase();
+    const from = `${String(to24(h1, ap1)).padStart(2, "0")}:${String(min1).padStart(
+      2,
+      "0"
+    )}`;
+    const to = `${String(to24(h2, ap2)).padStart(2, "0")}:${String(min2).padStart(
+      2,
+      "0"
+    )}`;
+    return { from, to };
+  }
+  if (/mañana/.test(t)) return { from: "09:00", to: "12:00" };
+  if (/tarde/.test(t)) return { from: "14:00", to: "18:00" };
+  if (/noche/.test(t)) return { from: "18:00", to: "21:00" };
+  return { from: null, to: null };
+}
+
+function calculateTotalAmount(items) {
+  if (!Array.isArray(items)) return 0;
+  return items.reduce(
+    (total, item) =>
+      total + Number(item.qty || 1) * Number(item.unit_price || 0),
+    0
+  );
+}
+
+function locationHash(lat, lng) {
+  if (lat == null || lng == null) return null;
+  return `${lat.toFixed(5)},${lng.toFixed(5)}`;
+}
+
+function timeSalutation() {
+  const h = nowInLaPaz().getHours();
+  if (h < 12) return "¡Buenos días";
+  if (h < 20) return "¡Buenas tardes";
+  return "¡Buenas noches";
+}
+
+async function say(ctx, text, extra) {
+  try {
+    return await ctx.reply(text, { ...extra, parse_mode: "Markdown" });
+  } catch (e) {
+    console.warn("send fail:", e?.message);
+  }
+}
+
+// ===============================================================
+// =========== HERRAMIENTAS PARA EL CEREBRO ORQUESTADOR ==========
+// ===============================================================
+
+const tools = [
+  {
+    type: "function",
+    function: {
+      name: "start_return_process",
+      description: "Inicia el flujo para registrar una nueva devolución de producto.",
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "find_order_for_return",
+      description:
+        "Busca un pedido por su número para iniciar una devolución.",
+      parameters: {
+        type: "object",
+        properties: {
+          order_no: {
+            type: "string",
+            description: 'El número del pedido a buscar. Ej: "27"',
+          },
+        },
+        required: ["order_no"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "set_return_quantity",
+      description:
+        "Establece la cantidad de un producto a devolver. Debe extraer el número de la frase del usuario.",
+      parameters: {
+        type: "object",
+        properties: {
+          quantity: {
+            type: "number",
+            description: "La cantidad numérica a devolver. Ej: 1",
+          },
+        },
+        required: ["quantity"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "set_return_reason",
+      description:
+        "Establece el motivo o la razón por la que un producto se está devolviendo.",
+      parameters: {
+        type: "object",
+        properties: {
+          reason: {
+            type: "string",
+            description:
+              "La explicación del usuario sobre el motivo de la devolución.",
+          },
+        },
+        required: ["reason"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "set_return_amount",
+      description:
+        "Establece el monto de dinero que se le devolverá al cliente.",
+      parameters: {
+        type: "object",
+        properties: {
+          amount: {
+            type: "number",
+            description: "El monto numérico a devolver. Ej: 50.5",
+          },
+        },
+        required: ["amount"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "confirm_and_save_return",
+      description:
+        "Confirma todos los datos recolectados y guarda la devolución en la base de datos.",
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "answer_in_text",
+      description:
+        "Responde al usuario con un texto general cuando ninguna otra herramienta es apropiada, por ejemplo para saludar o pedir aclaraciones.",
+      parameters: {
+        type: "object",
+        properties: {
+          response_text: {
+            type: "string",
+            description: "El texto a enviar al usuario.",
+          },
+        },
+        required: ["response_text"],
+      },
+    },
+  },
+];
+
+// ===============================================================
+// ===================== SERVICIOS EXTERNOS ======================
+// ===============================================================
+
+async function reverseGeocode(lat, lng) {
+  try {
+    const { data } = await axios.get(
+      "https://api.opencagedata.com/geocode/v1/json",
+      {
+        params: {
+          q: `${lat},${lng}`,
+          key: process.env.OPENCAGE_API_KEY,
+          language: "es",
+        },
+        timeout: 8000,
+      }
+    );
+    const best = data?.results?.[0];
+    const formatted = best?.formatted || `Latitud: ${lat}, Longitud: ${lng}`;
+    const comp = best?.components || {};
+    const city =
+      comp.city ||
+      comp.town ||
+      comp.village ||
+      comp.county ||
+      comp.state ||
+      null;
+    const country = comp.country || null;
+    return { address: formatted, city, country };
+  } catch (e) {
+    console.error("OpenCage error:", e?.message);
+    return {
+      address: `Latitud: ${lat}, Longitud: ${lng}`,
+      city: null,
+      country: null,
+    };
+  }
+}
+
+async function expandUrl(url) {
+  try {
+    const resp = await axios.get(url, { maxRedirects: 5, timeout: 8000 });
+    return resp.request?.res?.responseUrl || url;
+  } catch (e) {
+    return url;
+  }
+}
+
+async function extractLocation(text) {
+  const GOOGLE_URL_REGEX =
+    /(https?:\/\/(?:www\.)?(?:maps\.app\.goo\.gl|google\.[a-z]{2,}\/maps)[^\s]+)/i;
+  const urlMatch = text.match(GOOGLE_URL_REGEX);
+  if (!urlMatch) return null;
+  const finalUrl = await expandUrl(urlMatch[0]);
+  let lat = null,
+    lng = null;
+  const patterns = [
+    /@(-?\d+\.\d+),(-?\d+\.\d+),(\d+)/,
+    /!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/,
+    /[?&]q=(-?\d+\.\d+),(-?\d+\.\d+)/,
+    /[?&]ll=(-?\d+\.\d+),(-?\d+\.\d+)/,
+  ];
+  for (const re of patterns) {
+    const m = finalUrl.match(re);
+    if (m && m.length >= 3) {
+      lat = parseFloat(m[1]);
+      lng = parseFloat(m[2]);
+      break;
+    }
+  }
+  if (lat != null && lng != null) {
+    const geo = await reverseGeocode(lat, lng);
+    return {
+      lat,
+      lng,
+      address: geo.address,
+      city: geo.city,
+      country: geo.country,
+      originalUrl: urlMatch[0],
+    };
+  }
+  console.warn(`No se pudieron extraer coordenadas de la URL final: ${finalUrl}`);
+  return null;
+}
+
+async function uploadTelegramPhotoToSupabase(ctx, bucket) {
+  try {
+    const photo = ctx.message.photo[ctx.message.photo.length - 1];
+    const fileLink = await ctx.telegram.getFileLink(photo.file_id);
+    const response = await axios.get(fileLink.href, { responseType: "arraybuffer" });
+    const imageBuffer = Buffer.from(response.data);
+    const fileExtension = (fileLink.pathname.split(".").pop() || "jpg").split("?")[0];
+    const fileName = `${bucket}_${ctx.chat.id}_${Date.now()}.${fileExtension}`;
+    const { error } = await supabase.storage.from(bucket).upload(fileName, imageBuffer, {
+      contentType: response.headers["content-type"] || "image/jpeg",
+      upsert: false,
+    });
+    if (error) throw error;
+    const {
+      data: { publicUrl },
+    } = supabase.storage.from(bucket).getPublicUrl(fileName);
+    return publicUrl;
+  } catch (e) {
+    console.error(`upload image fail to bucket ${bucket}:`, e?.message);
+    return null;
+  }
+}
+
+// ===============================================================
+// ===================== PERFILES / AUTH =========================
+// ===============================================================
+
+async function getUserProfile(telegramUsername) {
+  if (!telegramUsername) {
+    console.warn("getUserProfile: telegramUsername is null or undefined");
+    return null;
+  }
+  try {
+    const { data, error } = await supabase
+      .from("people")
+      .select("id, role, full_name, telegram_username, active")
+      .eq("telegram_username", telegramUsername)
+      .eq("active", true)
+      .maybeSingle();
+    if (error) {
+      console.error("getUserProfile error:", error?.message);
+      return null;
+    }
+    return data;
+  } catch (e) {
+    console.error("getUserProfile unexpected error:", e?.message);
+    return null;
+  }
+}
+
+function roleFromProfile(profile) {
+  const role = normalizeString(profile?.role || "");
+  if (role === "promotor") return "delivery";
+  return "seller";
+}
+
+// ===============================================================
+// =========== EXTRACCIÓN Y VERIFICACIÓN CON IA ==================
+// ===============================================================
+
+async function extractOrderDetailsWithGPT(rawText, existingOrder = {}) {
+  const jsonFormat = `{\n  \"items\":[{\"name\":string,\"qty\":number,\"unit_price\":number|null,\"base_product_name\":string, \"sale_type\":\"unidad\"|\"mayor\"|null}],\n  \"customer_phone\":string|null,\n  \"customer_name\":string|null,\n  \"notes\":[string]\n}`;
+
+  const systemPrompt = `Eres "Agente Fenix", un asistente de IA para registrar pedidos. Extraes datos de texto y los devuelves en JSON.
+Reglas CRÍTICAS:
+1. Para cada item, extrae 'name', 'qty', 'unit_price' (si existe), y 'base_product_name'.
+2. **IMPORTANTE**: Para cada item, determina su 'sale_type'. Usa "mayor" si el texto contiene palabras como "caja", "fardo", "bulto", "docena", "por mayor" o si la cantidad es alta (ej. > 10). De lo contrario, usa "unidad". Si no estás seguro, usa "unidad".
+3. NO inventes datos. Tu única respuesta debe ser el JSON.
+
+Formato JSON esperado: ${jsonFormat}`;
+
+  try {
+    const resp = await oai.chat.completions.create({
+      model: "gpt-4o",
+      temperature: 0,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: rawText },
+      ],
+      response_format: { type: "json_object" },
+    });
+    const parsed = JSON.parse(resp?.choices?.[0]?.message?.content || "{}");
+    if (parsed.items) {
+      parsed.items.forEach((item) => {
+        if (!item.base_product_name) item.base_product_name = item.name;
+        if (!item.sale_type) item.sale_type = "unidad";
+      });
+    }
+    return parsed;
+  } catch (e) {
+    console.error("OpenAI extraction fail:", e?.message);
+    return null;
+  }
+}
+
+async function verifyPhotoWithGPT(imageUrl, itemsToVerify, allOrderItems) {
+  if (!itemsToVerify || itemsToVerify.length === 0) {
+    return { verified: true, reason: "No se requerían items específicos para verificar." };
+  }
+
+  const systemPrompt = `Eres un asistente de IA para verificar pedidos. Tu función es analizar una imagen y determinar si contiene todos los productos de una lista.
+Reglas:
+1.  Compara la lista de productos requeridos con la imagen proporcionada.
+2.  Responde únicamente con un objeto JSON con el formato: {"verified": boolean, "reason": string}.
+3.  'verified' debe ser TRUE solo si TODOS los productos de la lista están claramente visibles en la imagen.
+4.  'reason' debe ser una explicación MUY BREVE en español de tu decisión. Ej: "Todos los productos están presentes." o "Falta la polera azul en la foto."`;
+
+  let userPromptText = `Por favor, verifica si la imagen contiene los siguientes productos:\n`;
+
+  allOrderItems.forEach((item) => {
+    const baseName = item.base_product_name || item.name;
+    const quantity = item.qty || 1;
+    userPromptText += `- ${quantity} unidad(es) de ${baseName}.\n`;
+  });
+
+  try {
+    const resp = await oai.chat.completions.create({
+      model: "gpt-4o",
+      messages: [
+        { role: "system", content: systemPrompt },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: userPromptText },
+            { type: "image_url", image_url: { url: imageUrl } },
+          ],
+        },
+      ],
+      response_format: { type: "json_object" },
+    });
+    const parsed = JSON.parse(resp.choices[0].message.content || "{}");
+    return {
+      verified: !!parsed.verified,
+      reason: parsed.reason || "No se pudo obtener una razón.",
+    };
+  } catch (e) {
+    console.error("GPT Vision verification fail:", e?.message);
+    return {
+      verified: false,
+      reason: "Error al procesar la imagen con la IA.",
+    };
+  }
+}
+
+// ===============================================================
+// ====================== PERSISTENCIA ORDEN =====================
+// ===============================================================
+
+async function insertOrder({ sellerProfile, orderData, chatId }) {
+  const items = orderData.items || [];
+  const totalAmount = calculateTotalAmount(items);
+  const timeRange = parseTimeRange(orderData.time_preference);
+
+  const { data: insertedOrder, error: orderError } = await supabase
+    .from("orders")
+    .insert({
+      seller: sellerProfile?.full_name || `tg_user_${chatId}`,
+      sales_user_id: sellerProfile?.id || null,
+      sales_role: roleFromProfile(sellerProfile),
+      customer_id: normalizePhone(orderData.customer_phone) || `anon-${chatId}`,
+      amount: totalAmount,
+      status: "pending",
+      customer_phone: normalizePhone(orderData.customer_phone),
+      customer_name: orderData.customer_name,
+      delivery_address: orderData.is_encomienda ? null : orderData.location?.address,
+      delivery_geo_lat: orderData.is_encomienda ? null : orderData.location?.lat,
+      delivery_geo_lng: orderData.is_encomienda ? null : orderData.location?.lng,
+      delivery_date: orderData.delivery_date,
+      delivery_from: timeRange.from,
+      delivery_to: timeRange.to,
+      notes: orderData.notes?.join(" | "),
+      image_url: orderData.image_url,
+      is_encomienda: orderData.is_encomienda,
+      destino: orderData.is_encomienda ? orderData.destino : orderData.location?.city,
+      lat: orderData.is_encomienda ? null : orderData.location?.lat,
+      lng: orderData.is_encomienda ? null : orderData.location?.lng,
+      location_hash:
+        !orderData.is_encomienda && orderData.location?.lat != null
+          ? locationHash(orderData.location.lat, orderData.location.lng)
+          : null,
+    })
+    .select("id, order_no")
+    .single();
+
+  if (orderError) {
+    console.error("Error inserting order:", orderError);
+    throw orderError;
+  }
+
+  for (const it of items) {
+    const qty = Number(it.qty || 1);
+    const unit_price = Number(it.unit_price || 0);
+    const { error: itemError } = await supabase.from("order_items").insert({
+      order_id: insertedOrder.id,
+      product_name: it.name,
+      quantity: qty,
+      unit_price: unit_price,
+      subtotal: qty * unit_price,
+      image_url: it.image_url || null,
+      sale_type: it.sale_type || "unidad",
+    });
+    if (itemError) console.error("Error inserting item:", itemError);
+  }
+
+  for (const p of orderData.payments || []) {
+    const { error: paymentError } = await supabase.from("order_payments").insert({
+      order_id: insertedOrder.id,
+      amount: p.amount,
+      method: p.method,
+      status: p.status,
+      payment_proof_url: p.payment_proof_url || null,
+    });
+    if (paymentError) console.error("Error inserting payment:", paymentError);
+  }
+
+  return insertedOrder;
+}
+
+// ===============================================================
+// =================== FLUJO DE DEVOLUCIONES =====================
+// ===============================================================
+
+async function startReturnFlow(ctx) {
+  const s = getState(ctx.chat.id);
+  STATE.set(ctx.chat.id, getInitialState());
+  const s_new = getState(ctx.chat.id);
+  s_new.userProfile = s.userProfile;
+  s_new.returnState.currentStep = "awaiting_order_no";
+  await say(
+    ctx,
+    "Entendido. Para iniciar el registro de una devolución, por favor, envíame el número del pedido (Ej: 12345)."
+  );
+}
+
+async function advanceReturnConversation(ctx) {
+  const s = getState(ctx.chat.id);
+  const rState = s.returnState;
+  const step = rState.currentStep;
+
+  if (step === "awaiting_items") {
+    const order = rState.originalOrder;
+    const itemButtons = order.order_items.map((item) =>
+      Markup.button.callback(
+        `${item.quantity}x ${item.product_name}`,
+        `RETURN_ITEM_${item.id}`
+      )
+    );
+    await say(
+      ctx,
+      `Pedido #${order.order_no} encontrado (Cliente: *${order.customer_name}*). ¿Qué producto de este pedido se va a devolver?`,
+      Markup.inlineKeyboard(itemButtons, { columns: 1 })
+    );
+    return;
+  }
+
+  if (step === "awaiting_quantity") {
+    const productName = rState.returnDetails.items[0].product_name;
+    await say(
+      ctx,
+      `Entendido. ¿Cuántas unidades de *${productName}* se van a devolver?`
+    );
+    return;
+  }
+
+  if (step === "awaiting_reason") {
+    await say(
+      ctx,
+      "Perfecto. Ahora, por favor, describe brevemente el motivo de la devolución."
+    );
+    return;
+  }
+
+  if (step === "awaiting_amount") {
+    await say(
+      ctx,
+      "¿Cuál es el monto total en Bolivianos (Bs.) que se devolverá al cliente?"
+    );
+    return;
+  }
+
+  if (step === "confirming") {
+    const summary = buildReturnSummaryText(rState);
+    await say(
+      ctx,
+      `📝 **Resumen de Devolución**\nPor favor, revisa que todos los datos sean correctos:\n\n${summary}`,
+      Markup.inlineKeyboard([
+        Markup.button.callback("✅ Confirmar Devolución", "CONFIRM_RETURN"),
+        Markup.button.callback("❌ Cancelar", "CANCEL_RETURN"),
+      ])
+    );
+  }
+}
+
+function buildReturnSummaryText(rState) {
+  const { originalOrder, returnDetails } = rState;
+  const lines = [
+    `• *Pedido Original:* #${originalOrder.order_no}`,
+    `• *Cliente:* ${originalOrder.customer_name}`,
+    `• *Vendedor Original:* ${originalOrder.seller}`,
+    `• *Ítem a devolver:*`,
+    ...returnDetails.items.map((it) => `  - ${it.quantity}x ${it.product_name}`),
+    `• *Motivo:* ${returnDetails.reason}`,
+    `• *Monto a Devolver:* ${returnDetails.return_amount} Bs.`,
+  ];
+  return lines.join("\n");
+}
+
+async function insertReturn(ctx) {
+  const s = getState(ctx.chat.id);
+  const { originalOrder, returnDetails } = s.returnState;
+  const userProfile = s.userProfile;
+
+  try {
+    const { data: returnData, error } = await supabase
+      .from("product_returns")
+      .insert({
+        original_order_id: originalOrder.id,
+        original_order_no: originalOrder.order_no,
+        original_seller_name: originalOrder.seller,
+        original_customer_name: originalOrder.customer_name,
+        return_date: new Date(),
+        return_amount: returnDetails.return_amount,
+        reason: returnDetails.reason,
+        processed_by_user_id: userProfile?.id || null,
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    for (const item of returnDetails.items) {
+      await supabase.from("return_items").insert({
+        return_id: returnData.id,
+        product_name: item.product_name,
+        quantity: item.quantity,
+      });
+    }
+    return returnData;
+  } catch (e) {
+    console.error("Error al insertar devolución:", e);
+    throw e;
+  }
+}
+
+// ===============================================================
+// =================== CEREBRO ORQUESTADOR =======================
+// ===============================================================
+
+function createOrchestratorPrompt(state) {
+  return `Eres "Agente Fenix", un asistente de IA experto en gestión de pedidos y devoluciones para una tienda en Bolivia. Tu personalidad es amable, proactiva y muy eficiente.
+    
+Tu Misión: Orquestar la conversación para guiar al usuario a través de los procesos de venta o devolución de la forma más natural posible. Analizas cada mensaje del usuario, consideras el estado actual de la conversación, y eliges la herramienta más adecuada para avanzar.
+
+Estado Actual de la Conversación (Tu Memoria):
+\`\`\`json
+${JSON.stringify(state, null, 2)}
+\`\`\`
+
+Reglas Críticas de Comportamiento:
+1.  **Mantén el Contexto:** Tu prioridad es el proceso activo. Si 'returnState.currentStep' es algo diferente a 'initial', estás en una devolución. Enfócate en completarla.
+2.  **Infiere y Extrae:** Si el usuario dice "se vendio solo 1 por tanto 1", y el estado es 'awaiting_quantity', debes usar la herramienta 'set_return_quantity' con el valor 1.
+3.  **Usa tus Herramientas:** Tu única respuesta debe ser una llamada a una de las herramientas disponibles.
+4.  **Flujo de Devolución:** El flujo normal es: 'find_order_for_return' -> (selección de ítem por botón) -> 'set_return_quantity' -> 'set_return_reason' -> 'set_return_amount' -> 'confirm_and_save_return'.`;
+}
+
+async function orchestrateResponse(ctx, text) {
+  const s = getState(ctx.chat.id);
+  const systemPrompt = createOrchestratorPrompt(s);
+
+  try {
+    const resp = await oai.chat.completions.create({
+      model: "gpt-4o",
+      temperature: 0,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: text },
+      ],
+      tools: tools,
+      tool_choice: "auto",
+    });
+
+    const toolCall = resp.choices[0].message.tool_calls?.[0];
+    if (toolCall) {
+      const toolName = toolCall.function.name;
+      const params = JSON.parse(toolCall.function.arguments);
+      console.log(
+        `Orquestador decidió usar la herramienta: ${toolName} con params:`,
+        params
+      );
+      await executeTool(ctx, toolName, params);
+    } else {
+      console.warn(
+        "GPT no eligió una herramienta. Respuesta:",
+        resp.choices[0].message.content
+      );
+      await say(
+        ctx,
+        resp.choices[0].message.content ||
+          "No estoy seguro de cómo continuar, ¿puedes intentarlo de nuevo?"
+      );
+    }
+  } catch (error) {
+    console.error("Error en el Orquestador:", error);
+    await say(ctx, "Tuve un problema procesando tu mensaje. Intentémoslo de nuevo.");
+  }
+}
+
+async function executeTool(ctx, toolName, params) {
+  const s = getState(ctx.chat.id);
+
+  switch (toolName) {
+    case "start_return_process":
+      await startReturnFlow(ctx);
+      break;
+    case "find_order_for_return":
+      const { data: order, error } = await supabase
+        .from("orders")
+        .select(
+          `id, order_no, customer_name, seller, order_items(id, product_name, quantity)`
+        )
+        .eq("order_no", params.order_no)
+        .single();
+      if (error || !order) {
+        await say(
+          ctx,
+          `❌ No encontré ningún pedido con el número *${params.order_no}*.`
+        );
+        return;
+      }
+      s.returnState.originalOrder = order;
+      s.returnState.currentStep = "awaiting_items";
+      await advanceReturnConversation(ctx);
+      break;
+    case "set_return_quantity":
+      s.returnState.returnDetails.items[0].quantity = params.quantity;
+      s.returnState.currentStep = "awaiting_reason";
+      await advanceReturnConversation(ctx);
+      break;
+    case "set_return_reason":
+      s.returnState.returnDetails.reason = params.reason;
+      s.returnState.currentStep = "awaiting_amount";
+      await advanceReturnConversation(ctx);
+      break;
+    case "set_return_amount":
+      s.returnState.returnDetails.return_amount = params.amount;
+      s.returnState.currentStep = "confirming";
+      await advanceReturnConversation(ctx);
+      break;
+    case "confirm_and_save_return":
+      await ctx.reply("⏳ Registrando la devolución, un momento por favor...");
+      const inserted = await insertReturn(ctx);
+      await say(
+        ctx,
+        `✅ ¡Devolución #${inserted.id} registrada exitosamente para el pedido #${s.returnState.originalOrder.order_no}!`
+      );
+      const profile = s.userProfile;
+      STATE.set(ctx.chat.id, getInitialState());
+      STATE.get(ctx.chat.id).userProfile = profile;
+      break;
+    case "answer_in_text":
+      await say(ctx, params.response_text);
+      break;
+    default:
+      console.warn(`Herramienta desconocida llamada: ${toolName}`);
+      await say(ctx, "Intenté hacer algo que no sé hacer. Por favor, contacta a soporte.");
+  }
+}
+
+// ===============================================================
+// ===================== SALUDOS INTELIGENTES ====================
+// ===============================================================
+
+function buildGreetings({ oai, say, getUserProfile, getState }) {
+  function displayNameFromCtx(ctx, profile) {
+    return (
+      profile?.full_name ||
+      ctx?.from?.first_name ||
+      ctx?.chat?.first_name ||
+      ctx?.from?.username ||
+      "allí"
+    );
+  }
+  function isGreetingText(text) {
+    if (!text) return false;
+    const t = normalizeString(text);
+    return [
+      /(hola|buen dia|buenos dias|buenas|saludos)\b/,
+      /\b(hi|hello|hey)\b/,
+      /^\/start$/,
+    ].some((re) => re.test(t));
+  }
+  function buildStaticGreeting({ ctx, profile, mode }) {
+    const name = displayNameFromCtx(ctx, profile),
+      saludo = `${timeSalutation()}, ${name}!`;
+    if (mode === "delivery")
+      return `${saludo}\nSoy Agente Fenix Delivery. Envíame N° de pedido/foto de comprobante.`;
+    return `${saludo}\nSoy Agente Fenix. Envíame productos, ubicación y horario. O una foto de la lista.`;
+  }
+  async function generateGreetingWithGPT({ ctx, profile, mode }) {
+    try {
+      const name = displayNameFromCtx(ctx, profile),
+        saludo = timeSalutation();
+      const prompt = `Genera un saludo cálido para ${name}. Es ${saludo.toLowerCase()} en Bolivia. Soy Agente Fenix, un asistente de IA para pedidos${
+        mode === "delivery" ? " y entregas" : ""
+      }. Tono amigable, 2 líneas max.`;
+      const resp = await oai.chat.completions.create({
+        model: "gpt-4o",
+        temperature: 0.7,
+        max_tokens: 100,
+        messages: [{ role: "user", content: prompt }],
+      });
+      const content = resp?.choices?.[0]?.message?.content?.trim();
+      if (content) return content;
+    } catch (e) {
+      /* fallback */
+    }
+    return buildStaticGreeting({ ctx, profile, mode });
+  }
+  async function greetUser(ctx, opts = {}) {
+    const s = getState(ctx.chat.id);
+    const profile = s?.userProfile || (await getUserProfile(ctx?.from?.username));
+    if (s && !s.userProfile) s.userProfile = profile || null;
+    const mode = roleFromProfile(profile);
+    const greeting = opts?.static
+      ? buildStaticGreeting({ ctx, profile, mode })
+      : await generateGreetingWithGPT({ ctx, profile, mode });
+    await say(ctx, greeting);
+    if (mode === "delivery")
+      await say(ctx, "Envíame el número de pedido y te acompaño con la entrega.");
+    else
+      await say(
+        ctx,
+        "Pásame productos, ubicación y fecha/horario. Yo preparo el resumen."
+      );
+  }
+  return { isGreetingText, greetUser };
+}
+const Greetings = buildGreetings({ oai, say, getUserProfile, getState });
+
+// ===============================================================
+// =================== FLUJO CONVERSACIONAL (UX/UI) ==============
+// ===============================================================
+
+function buildOrderTypeKeyboard() {
+  return Markup.inlineKeyboard([
+    Markup.button.callback("🛵 Entrega Local", "SET_ORDER_TYPE_LOCAL"),
+    Markup.button.callback("📦 Encomienda", "SET_ORDER_TYPE_ENCOMIENDA"),
+  ]);
+}
+
+function buildPaymentMethodKeyboard() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback("💵 Efectivo", "SET_PAYMENT_EFECTIVO"),
+      Markup.button.callback("📲 QR", "SET_PAYMENT_QR"),
+    ],
+    [Markup.button.callback("🏦 Transferencia", "SET_PAYMENT_TRANSFERENCIA")],
+  ]);
+}
+
+function buildPaymentSplitKeyboard(total) {
+  return Markup.inlineKeyboard([
+    Markup.button.callback(`Pagar Total (Bs ${total}) Ahora`, "PAY_FULL_NOW"),
+    Markup.button.callback("Pagar una Parte Ahora", "PAY_PARTIAL_NOW"),
+    Markup.button.callback("Pagar Todo en la Entrega", "PAY_FULL_ON_DELIVERY"),
+  ]);
+}
+
+function buildFinalConfirmKeyboard() {
+  return Markup.inlineKeyboard([
+    Markup.button.callback("✅ Confirmar y Enviar Pedido", "CONFIRM_ORDER"),
+    Markup.button.callback("✏️ Editar", "EDIT_ORDER"),
+  ]);
+}
+
+function buildSummaryText(p) {
+  const lines = [];
+  const totalAmount = calculateTotalAmount(p.items);
+
+  if (p.items?.length) {
+    const itemsText = p.items
+      .map((i) => `${i.qty || 1}× ${i.name} (${i.sale_type || "unidad"})`)
+      .join("\n  ");
+    lines.push(`• Items:\n  ${itemsText}`);
+  }
+
+  lines.push(`• 💰 **Monto Total: ${totalAmount.toFixed(2)} Bs.**`);
+
+  if (p.payments?.length) {
+    lines.push("• Pagos Registrados:");
+    p.payments.forEach((payment) => {
+      const statusText =
+        payment.status === "completado"
+          ? "✅ Pagado"
+          : "🚚 A pagar en entrega";
+      const proofText = payment.payment_proof_url ? " (comprobante adjunto)" : "";
+      lines.push(
+        `  - Bs ${payment.amount.toFixed(2)} (${payment.method}) - ${statusText}${proofText}`
+      );
+    });
+  }
+
+  if (p.customer_name)
+    lines.push(`• Cliente: ${p.customer_name} (${normalizePhone(p.customer_phone)})`);
+  if (p.time_preference) lines.push(`• Horario: ${p.time_preference}`);
+
+  if (p.is_encomienda === false && p.location?.address) {
+    lines.push(`• Dirección: ${p.location.address}`);
+  } else if (p.is_encomienda === true && p.destino) {
+    lines.push(`• Destino (Encomienda): ${p.destino}`);
+  }
+
+  if (p.notes?.length > 0) lines.push(`• Notas: ${p.notes.join(" | ")}`);
+
+  return lines.join("\n");
+}
+
+// ===============================================================
+// ================= MANEJO MEJORADO DE ERRORES ==================
+// ===============================================================
+
+bot.catch((err, ctx) => {
+  console.error("Unhandled error while processing", ctx.update);
+  console.error("Error details:", err);
+  if (ctx && ctx.reply) {
+    ctx
+      .reply("Ocurrió un error inesperado. Por favor, intenta nuevamente.")
+      .catch((e) => console.error("Failed to send error message:", e));
+  }
+});
+
+// ACK temprano y handler seguro para callback_query
+async function safeCallbackHandler(ctx, handler) {
+  try {
+    const callbackAge =
+      Date.now() - (ctx.callbackQuery?.message?.date * 1000 || 0);
+    if (callbackAge > 5 * 60 * 1000) {
+      // botón viejo
+      try {
+        await ctx.answerCbQuery("Esta acción ha expirado.");
+      } catch (_) {}
+      return;
+    }
+    // **ACK INMEDIATO** para no perder la ventana <10s
+    try {
+      await ctx.answerCbQuery("Procesando…");
+    } catch (_) {}
+
+    // Ejecuta el handler real
+    await handler(ctx);
+  } catch (error) {
+    console.error("Callback handler error:", error);
+    // Si ya respondimos, Telegram puede tirar 400. Silenciar.
+    try {
+      await ctx.answerCbQuery("Error al procesar la acción.");
+    } catch (_) {}
+  }
+}
+
+async function safeEditMessage(ctx, text, markup) {
+  try {
+    if (ctx.callbackQuery?.message?.text === text) {
+      return;
+    }
+    await ctx.editMessageText(text, markup);
+  } catch (error) {
+    console.error("Edit message error:", error);
+    try {
+      await say(ctx, text, markup);
+    } catch (e) {
+      console.error("Fallback message error:", e);
+    }
+  }
+}
+
+function validateContext(ctx) {
+  if (!ctx || !ctx.chat || !ctx.chat.id) {
+    console.error("Contexto inválido o falta chat ID");
+    return false;
+  }
+  return true;
+}
+
+// ===============================================================
+// ================== HANDLERS TELEGRAM BOT ======================
+// ===============================================================
+
+bot.start(async (ctx) => {
+  await Greetings.greetUser(ctx);
+});
+
+async function advanceConversation(ctx) {
+  const s = getState(ctx.chat.id);
+  const p = s.saleState.partialOrder;
+
+  if (p.items.length === 0) {
+    s.saleState.currentStep = "initial";
+    await say(
+      ctx,
+      "Hola, para iniciar un pedido, envíame la lista de productos y cantidades."
+    );
+    return;
+  }
+  if (!p.customer_name && !p.customer_phone) {
+    s.saleState.currentStep = "awaiting_customer";
+    await say(
+      ctx,
+      "Tengo los productos. ¿A nombre de quién es el pedido y cuál es su número de teléfono?"
+    );
+    return;
+  }
+  if (p.is_encomienda === null) {
+    s.saleState.currentStep = "awaiting_order_type";
+    await say(
+      ctx,
+      "Ok, ¿el pedido es para entrega local o es una encomienda?",
+      buildOrderTypeKeyboard()
+    );
+    return;
+  }
+  if (p.is_encomienda === true && !p.destino) {
+    s.saleState.currentStep = "awaiting_destination";
+    await say(ctx, "Entendido, es encomienda. ¿A qué ciudad o departamento la enviamos?");
+    return;
+  }
+  if (p.is_encomienda === false && !p.location) {
+    s.saleState.currentStep = "awaiting_location";
+    await say(ctx, "Ok, es entrega local. Por favor, envíame la ubicación (link de Google Maps).");
+    return;
+  }
+
+  if (p.payments.length === 0) {
+    if (!s.saleState.paymentMethod) {
+      s.saleState.currentStep = "awaiting_payment_method";
+      await say(ctx, "Ya casi terminamos. ¿Cuál será el método de pago?", buildPaymentMethodKeyboard());
+      return;
+    }
+    s.saleState.currentStep = "awaiting_payment_split";
+    const total = calculateTotalAmount(p.items);
+    await say(
+      ctx,
+      `Perfecto, pago con *${s.saleState.paymentMethod}*. El total es de *Bs ${total.toFixed(
+        2
+      )}*. ¿Cómo procederá el cliente?`,
+      buildPaymentSplitKeyboard(total.toFixed(2))
+    );
+    return;
+  }
+
+  const proofNeeded = p.payments.find(
+    (pay) => pay.status === "completado" && pay.method !== "Efectivo" && !pay.payment_proof_url
+  );
+  if (proofNeeded) {
+    s.saleState.currentStep = "awaiting_payment_proof";
+    await say(
+      ctx,
+      `Para confirmar el pago de *Bs ${proofNeeded.amount.toFixed(
+        2
+      )}* con *${proofNeeded.method}*, por favor envía la foto del comprobante.`
+    );
+    return;
+  }
+
+  s.saleState.currentStep = "confirming";
+  const summary = buildSummaryText(p);
+  await say(
+    ctx,
+    `📝 **Resumen del Pedido**\nPor favor, revisa que todo esté correcto:\n\n${summary}`,
+    buildFinalConfirmKeyboard()
+  );
+}
+
+bot.on("text", async (ctx) => {
+  if (!validateContext(ctx)) return;
+  const text = ctx.message?.text || "";
+  if (text.startsWith("/")) return;
+
+  const s = getState(ctx.chat.id);
+  if (!s.userProfile) s.userProfile = await getUserProfile(ctx.from?.username);
+  const normalizedText = normalizeString(text);
+
+  if (
+    s.returnState.currentStep !== "initial" ||
+    ["devolucion", "devolver", "registrar devolucion"].some((kw) =>
+      normalizedText.includes(kw)
+    )
+  ) {
+    await orchestrateResponse(ctx, text);
+    return;
+  }
+
+  try {
+    const p = s.saleState.partialOrder;
+    const currentStep = s.saleState.currentStep;
+
+    if (currentStep === "awaiting_partial_amount") {
+      const amount = parseFloat(text.replace(/[^0-9.,]/g, "").replace(",", "."));
+      const total = calculateTotalAmount(p.items);
+      if (isNaN(amount) || amount <= 0 || amount >= total) {
+        await say(
+          ctx,
+          `Monto inválido. Debe ser mayor a 0 y menor a ${total}. Intenta de nuevo.`
+        );
+        return;
+      }
+      const method = s.saleState.paymentMethod;
+      p.payments.push({ amount, method, status: "completado" });
+      p.payments.push({
+        amount: total - amount,
+        method: "Efectivo",
+        status: "pendiente",
+      });
+
+      s.saleState.paymentMethod = null;
+      await advanceConversation(ctx);
+      return;
+    }
+
+    if (Greetings.isGreetingText(text)) {
+      await Greetings.greetUser(ctx);
+      return;
+    }
+
+    const loc = await extractLocation(text);
+    if (currentStep === "awaiting_location" && loc) {
+      p.location = loc;
+      await say(ctx, `✅ Ubicación recibida: ${loc.address}`);
+      await advanceConversation(ctx);
+      return;
+    }
+    if (currentStep === "awaiting_destination") {
+      p.destino = text;
+      await say(ctx, `✅ Destino para encomienda: ${text}`);
+      await advanceConversation(ctx);
+      return;
+    }
+
+    const parsed = await extractOrderDetailsWithGPT(text, p);
+    if (parsed) {
+      if (parsed.items) {
+        p.items = parsed.items;
+      }
+      Object.assign(p, {
+        customer_name: parsed.customer_name || p.customer_name,
+        customer_phone: parsed.customer_phone || p.customer_phone,
+        notes: parsed.notes || p.notes,
+      });
+    }
+    await advanceConversation(ctx);
+  } catch (error) {
+    console.error("Error en el flujo de ventas:", error);
+    await say(ctx, "Ocurrió un error al procesar tu mensaje de venta.");
+  }
+});
+
+bot.on("location", async (ctx) => {
+  if (!validateContext(ctx)) return;
+  const s = getState(ctx.chat.id);
+  const { latitude, longitude } = ctx.message?.location || {};
+  if (
+    latitude != null &&
+    longitude != null &&
+    s.saleState.currentStep === "awaiting_location"
+  ) {
+    const geo = await reverseGeocode(latitude, longitude);
+    s.saleState.partialOrder.is_encomienda = false;
+    s.saleState.partialOrder.location = {
+      lat: latitude,
+      lng: longitude,
+      address: geo.address,
+      city: geo.city,
+      country: geo.country,
+    };
+    await say(ctx, `✅ Ubicación para entrega local recibida: ${geo.address}`);
+    await advanceConversation(ctx);
+  }
+});
+
+bot.on("photo", async (ctx) => {
+  if (!validateContext(ctx)) return;
+  const s = getState(ctx.chat.id);
+  const saleStep = s.saleState.currentStep;
+
+  if (saleStep === "awaiting_payment_proof") {
+    await say(ctx, "📸 Procesando comprobante de pago...");
+    const url = await uploadTelegramPhotoToSupabase(
+      ctx,
+      CONSTANTS.BUCKETS.DELIVERY_PROOFS
+    );
+    if (url) {
+      const proofNeeded = s.saleState.partialOrder.payments.find(
+        (p) => p.status === "completado" && !p.payment_proof_url && p.method !== "Efectivo"
+      );
+      if (proofNeeded) {
+        proofNeeded.payment_proof_url = url;
+        await say(ctx, "Comprobante recibido y asociado al pago. ✅");
+      } else {
+        await say(
+          ctx,
+          "Comprobante recibido, pero no encontré un pago pendiente de comprobante."
+        );
+      }
+      await advanceConversation(ctx);
+    } else {
+      await say(ctx, "No pude guardar el comprobante, intenta de nuevo por favor.");
+    }
+    return;
+  }
+
+  if (saleStep === "awaiting_product_photo") {
+    return;
+  }
+
+  await say(ctx, "📸 He recibido una imagen general del pedido y la he guardado.");
+  const url = await uploadTelegramPhotoToSupabase(
+    ctx,
+    CONSTANTS.BUCKETS.ORDER_IMAGES
+  );
+  if (url) s.saleState.partialOrder.image_url = url;
+});
+
+bot.command("mayor", async (ctx) => {
+  await say(
+    ctx,
+    "El tipo de venta ahora se determina por producto. Describe tu pedido, incluyendo palabras como 'caja' o 'bulto' para items al por mayor."
+  );
+});
+
+bot.command("detalle", async (ctx) => {
+  await say(ctx, "El tipo de venta ahora se determina por producto. Simplemente describe tu pedido.");
+});
+
+bot.on("callback_query", async (ctx) => {
+  await safeCallbackHandler(ctx, async (ctx) => {
+    const chatId = ctx.chat?.id;
+    if (!chatId) {
+      await say(ctx, "Error: No se pudo identificar el chat.");
+      return;
+    }
+    const s = getState(chatId);
+    const data = ctx.callbackQuery?.data;
+
+    // NOTA: NO llamamos a ctx.answerCbQuery() aquí (ya se hizo al inicio)
+
+    const p = s.saleState.partialOrder;
+
+    if (data.startsWith("RETURN_")) {
+      if (data.startsWith("RETURN_ITEM_")) {
+        const itemId = data.replace("RETURN_ITEM_", "");
+        if (!s.returnState.originalOrder || !s.returnState.originalOrder.order_items) {
+          await say(ctx, "Hubo un problema de estado.");
+          return;
+        }
+        const item = s.returnState.originalOrder.order_items.find(
+          (i) => String(i.id) === String(itemId)
+        );
+        if (item) {
+          s.returnState.returnDetails.items = [
+            { product_name: item.product_name, quantity: null },
+          ];
+          s.returnState.currentStep = "awaiting_quantity";
+          try {
+            await ctx.deleteMessage();
+          } catch (_) {}
+          await advanceReturnConversation(ctx);
+        } else {
+          await say(ctx, "Lo siento, tuve un problema al procesar tu selección.");
+        }
+      }
+      if (data === "CONFIRM_RETURN") {
+        try {
+          await ctx.editMessageText("⏳ Registrando la devolución...");
+        } catch (_) {}
+        try {
+          const inserted = await insertReturn(ctx);
+          await say(ctx, `✅ ¡Devolución #${inserted.id} registrada exitosamente!`);
+          const profile = s.userProfile;
+          STATE.set(chatId, getInitialState());
+          STATE.get(chatId).userProfile = profile;
+        } catch (e) {
+          await say(ctx, `❌ No pude guardar la devolución. Error: ${e.message}`);
+        }
+      }
+      if (data === "CANCEL_RETURN") {
+        try {
+          await ctx.deleteMessage();
+        } catch (_) {}
+        await say(ctx, "Operación de devolución cancelada.");
+        const profile = s.userProfile;
+        STATE.set(chatId, getInitialState());
+        STATE.get(chatId).userProfile = profile;
+      }
+      return;
+    }
+
+    const paymentMethodMap = {
+      SET_PAYMENT_EFECTIVO: "Efectivo",
+      SET_PAYMENT_QR: "QR",
+      SET_PAYMENT_TRANSFERENCIA: "Transferencia",
+    };
+    if (paymentMethodMap[data]) {
+      s.saleState.paymentMethod = paymentMethodMap[data];
+      try {
+        await ctx.deleteMessage();
+      } catch (_) {}
+      await advanceConversation(ctx);
+      return;
+    }
+
+    const actionMap = {
+      SET_ORDER_TYPE_LOCAL: () => {
+        p.is_encomienda = false;
+      },
+      SET_ORDER_TYPE_ENCOMIENDA: () => {
+        p.is_encomienda = true;
+      },
+    };
+    if (actionMap[data]) {
+      actionMap[data]();
+      try {
+        await ctx.deleteMessage();
+      } catch (_) {}
+      await advanceConversation(ctx);
+      return;
+    }
+
+    if (data === "PAY_FULL_NOW") {
+      const total = calculateTotalAmount(p.items);
+      const method = s.saleState.paymentMethod;
+      p.payments.push({ amount: total, method, status: "completado" });
+      s.saleState.paymentMethod = null;
+      try {
+        await ctx.deleteMessage();
+      } catch (_) {}
+      await advanceConversation(ctx);
+      return;
+    }
+    if (data === "PAY_PARTIAL_NOW") {
+      s.saleState.currentStep = "awaiting_partial_amount";
+      const total = calculateTotalAmount(p.items);
+      try {
+        await ctx.editMessageText(
+          `Entendido. Se pagará una parte con *${s.saleState.paymentMethod}* y el resto en efectivo.\n\nEl total es de *Bs ${total.toFixed(
+            2
+          )}*. ¿Qué monto se pagará ahora?`
+        );
+      } catch (_) {}
+      return;
+    }
+    if (data === "PAY_FULL_ON_DELIVERY") {
+      const total = calculateTotalAmount(p.items);
+      p.payments.push({ amount: total, method: "Efectivo", status: "pendiente" });
+      s.saleState.paymentMethod = null;
+      try {
+        await ctx.deleteMessage();
+      } catch (_) {}
+      await advanceConversation(ctx);
+      return;
+    }
+
+    if (data === "CONFIRM_ORDER") {
+      try {
+        await ctx.editMessageText("⏳ Guardando tu pedido...");
+      } catch (_) {}
+      try {
+        const inserted = await insertOrder({
+          sellerProfile: s.userProfile,
+          orderData: p,
+          chatId,
+        });
+        await say(
+          ctx,
+          `✅ ¡Pedido #${inserted.order_no || inserted.id} guardado exitosamente!`
+        );
+        const profile = s.userProfile;
+        STATE.set(chatId, getInitialState());
+        STATE.get(chatId).userProfile = profile;
+      } catch (e) {
+        console.error("insert order fail:", e);
+        await say(ctx, `❌ No pude guardar el pedido. Error: ${e.message}`);
+      }
+      return;
+    }
+
+    if (data === "EDIT_ORDER") {
+      s.saleState.currentStep = "initial";
+      try {
+        await ctx.deleteMessage();
+      } catch (_) {}
+      await say(
+        ctx,
+        "Puedes corregir la información enviando un nuevo mensaje (ej: 'el cliente es Juan Perez'). ¿Qué deseas cambiar?"
+      );
+      return;
+    }
+
+    await say(ctx, "Acción no reconocida.");
+  });
+});
+
+// ===============================================================
+// =================== INICIO DEL BOT (RUN) ======================
+// ===============================================================
+
+async function main() {
+  try {
+    console.log("🤖 Bot iniciando...");
+    await bot.launch();
+    console.log("✅ Bot corriendo.");
+    process.once("SIGINT", () => bot.stop("SIGINT"));
+    process.once("SIGTERM", () => bot.stop("SIGTERM"));
+  } catch (e) {
+    console.error("Bot no pudo iniciar:", e?.message);
+    process.exit(1);
+  }
+}
+
+if (require.main === module) {
+  main();
+}

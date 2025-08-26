@@ -1,0 +1,22 @@
+{
+  "name": "fenix-bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.55.0",
+    "axios": "^1.11.0",
+    "date-fns": "^4.1.0",
+    "date-fns-tz": "^3.2.0",
+    "dotenv": "^17.2.1",
+    "openai": "^5.12.2",
+    "puppeteer": "^24.17.0",
+    "telegraf": "^4.16.3"
+  }
+}
