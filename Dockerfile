@@ -1,8 +1,9 @@
-# Usa una imagen oficial de Node.js que incluye herramientas de construcción
+# RUTA: Dockerfile (en la raíz de tu proyecto)
+
+# Usamos una imagen de Node.js 18 para coincidir con la advertencia de Supabase, pero puedes usar una más nueva
 FROM node:18-slim
 
 # Instala todas las dependencias que Puppeteer/Chrome necesita para correr en Linux
-# Este es el paso clave que soluciona el problema
 RUN apt-get update \
     && apt-get install -yq \
     gconf-service libasound2 libatk1.0-0 libc6 libcairo2 libcups2 libdbus-1-3 \
@@ -13,19 +14,26 @@ RUN apt-get update \
     libappindicator1 libnss3 lsb-release xdg-utils wget \
     --no-install-recommends
 
-# Establece el directorio de trabajo dentro del contenedor
+# Establece el directorio de trabajo
 WORKDIR /usr/src/app
 
 # Copia los archivos de dependencias
 COPY package*.json ./
 
-# Instala las dependencias de Node.js Y el navegador de Puppeteer
-# PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=false asegura que el navegador se descargue
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=false
+# --- LÓGICA DE INSTALACIÓN MEJORADA ---
+# 1. Le decimos a Puppeteer que NO descargue Chrome durante el npm install.
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+
+# 2. Instalamos las dependencias de Node.js
 RUN npm install
 
-# Copia el resto del código de tu aplicación
+# 3. Copiamos el resto del código de la aplicación
 COPY . .
 
-# El comando para iniciar tu bot cuando el contenedor se ejecute
+# 4. AHORA, le ordenamos a Puppeteer que instale el navegador de forma explícita.
+#    Esto es más robusto y nos da un control total.
+RUN npx puppeteer browsers install chrome
+# --- FIN DE LA LÓGICA MEJORADA ---
+
+# El comando para iniciar tu bot
 CMD [ "node", "index.js" ]
