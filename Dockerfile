@@ -3,16 +3,16 @@
 # Usamos una imagen de Node.js 18 para coincidir con la advertencia de Supabase, pero puedes usar una más nueva
 FROM node:18-slim
 
-# Instala todas las dependencias que Puppeteer/Chrome necesita para correr en Linux
+# --- LISTA DE DEPENDENCIAS ACTUALIZADA Y MÁS COMPLETA ---
+# Instala todas las dependencias que Puppeteer/Chrome necesita para correr en Linux, incluyendo libgbm1
 RUN apt-get update \
-    && apt-get install -yq \
-    gconf-service libasound2 libatk1.0-0 libc6 libcairo2 libcups2 libdbus-1-3 \
-    libexpat1 libfontconfig1 libgcc1 libgconf-2-4 libgdk-pixbuf2.0-0 libglib2.0-0 \
-    libgtk-3-0 libnspr4 libpango-1.0-0 libpangocairo-1.0-0 libstdc++6 libx11-6 \
-    libx11-xcb1 libxcb1 libxcomposite1 libxcursor1 libxdamage1 libxext6 libxfixes3 \
-    libxi6 libxrandr2 libxrender1 libxss1 libxtst6 ca-certificates fonts-liberation \
-    libappindicator1 libnss3 lsb-release xdg-utils wget \
-    --no-install-recommends
+    && apt-get install -yq wget gnupg \
+    && wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
+    && sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list' \
+    && apt-get update \
+    && apt-get install -y google-chrome-stable fonts-ipafont-gothic fonts-wqy-zenhei fonts-thai-tlwg fonts-kacst fonts-freefont-ttf libxss1 \
+      --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
 
 # Establece el directorio de trabajo
 WORKDIR /usr/src/app
@@ -20,20 +20,15 @@ WORKDIR /usr/src/app
 # Copia los archivos de dependencias
 COPY package*.json ./
 
-# --- LÓGICA DE INSTALACIÓN MEJORADA ---
-# 1. Le decimos a Puppeteer que NO descargue Chrome durante el npm install.
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+# 1. Le decimos a Puppeteer que NO descargue Chrome, porque ya lo instalamos con apt-get
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable
 
 # 2. Instalamos las dependencias de Node.js
 RUN npm install
 
 # 3. Copiamos el resto del código de la aplicación
 COPY . .
-
-# 4. AHORA, le ordenamos a Puppeteer que instale el navegador de forma explícita.
-#    Esto es más robusto y nos da un control total.
-RUN npx puppeteer browsers install chrome
-# --- FIN DE LA LÓGICA MEJORADA ---
 
 # El comando para iniciar tu bot
 CMD [ "node", "index.js" ]
