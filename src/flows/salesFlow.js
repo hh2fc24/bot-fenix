@@ -15,21 +15,31 @@ async function advanceConversation(ctx) {
     return say(ctx, `Para *"${nextAmbiguousItem.originalItem.name}"*, encontré estas opciones. Por favor, selecciona el nombre correcto:`, Markup.inlineKeyboard(buttons));
   }
   
-  const itemWithoutSaleType = p.items.find(item => !item.sale_type);
-  if (p.items.length > 0 && itemWithoutSaleType) {
+  // --- LÓGICA DE TIPO DE VENTA CORREGIDA ---
+  // Ahora buscamos el ÍNDICE del primer item que no tiene tipo de venta
+  const itemIndexWithoutSaleType = p.items.findIndex(item => !item.sale_type);
+
+  if (p.items.length > 0 && itemIndexWithoutSaleType !== -1) {
+    const itemToProcess = p.items[itemIndexWithoutSaleType];
+    const itemName = itemToProcess.original_name || itemToProcess.name;
+    
     s.saleState.currentStep = 'awaiting_sale_type';
-    s.saleState.itemNameToProcess = itemWithoutSaleType.original_name || itemWithoutSaleType.name; 
-    return say(ctx, `Para el producto *"${s.saleState.itemNameToProcess}"*, ¿es venta por mayor o al detalle?`, buildSaleTypeKeyboard(s.saleState.itemNameToProcess));
+    // Guardamos el índice para usarlo en el callbackHandler
+    s.saleState.itemIndexToProcess = itemIndexWithoutSaleType; 
+    
+    return say(
+      ctx, 
+      `Para el producto *"${itemName}"*, ¿es venta por mayor o al detalle?`, 
+      buildSaleTypeKeyboard(itemIndexWithoutSaleType) // Pasamos el ÍNDICE, no el nombre
+    );
   }
 
-  // --- NUEVA LÓGICA PARA PREGUNTAR PRECIO ---
   const itemWithoutPrice = p.items.find(item => item.unit_price === null || item.unit_price === undefined);
   if (p.items.length > 0 && itemWithoutPrice) {
       s.saleState.currentStep = 'awaiting_price';
       s.saleState.itemNameToProcess = itemWithoutPrice.name;
       return say(ctx, `¿Cuál es el precio unitario en Bs. para *${itemWithoutPrice.name}*?`);
   }
-  // --- FIN DE NUEVA LÓGICA ---
 
   const nextItemWithoutPhoto = p.items.find(item => item.image_url === null);
   if (p.items.length > 0 && nextItemWithoutPhoto) {
@@ -96,7 +106,6 @@ async function advanceConversation(ctx) {
   return say(ctx, `📝 **Resumen del Pedido**\nPor favor, revisa que todo esté correcto:\n\n${summary}`, buildFinalConfirmKeyboard());
 }
 
-// (El resto de las funciones de salesFlow.js no cambian)
 async function handleProductAddition(ctx, item) {
     const s = getState(ctx.chat.id);
     const similarProducts = await findSimilarProducts(item.name);
@@ -137,7 +146,6 @@ async function processClarification(ctx, choice, ambiguousItem) {
     }
 
     if (productData) {
-        // Asignamos el precio si venía en el objeto original
         productData.unit_price = ambiguousItem.originalItem.unit_price;
         p.items.push(productData);
         const priceInfo = productData.unit_price ? ` (a Bs ${productData.unit_price})` : '';
@@ -146,11 +154,10 @@ async function processClarification(ctx, choice, ambiguousItem) {
     }
 }
 
-function buildSaleTypeKeyboard(itemName) {
-  const encodedItemName = encodeURIComponent(itemName);
+function buildSaleTypeKeyboard(itemIndex) {
   return Markup.inlineKeyboard([
-    Markup.button.callback("📦 Venta por Mayor", `SET_SALE_TYPE_WHOLESALE_${encodedItemName}`),
-    Markup.button.callback("🛍️ Venta al Detalle", `SET_SALE_TYPE_RETAIL_${encodedItemName}`),
+    Markup.button.callback("📦 Venta por Mayor", `SET_SALE_TYPE_WHOLESALE_${itemIndex}`),
+    Markup.button.callback("🛍️ Venta al Detalle", `SET_SALE_TYPE_RETAIL_${itemIndex}`),
   ]);
 }
 function buildOrderTypeKeyboard() {
